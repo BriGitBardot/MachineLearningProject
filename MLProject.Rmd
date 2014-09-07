@@ -1,0 +1,147 @@
+---
+title: "Predicting Excercise Quality"
+author: "Annika Hamachers"
+date: "Sunday, September 07, 2014"
+output: html_document
+---
+
+## 1. Summary
+The goal of the project at hand was to predict the quality in which six young healthy participants carried out an unilateral dumbbell biceps curl. 
+During data collection they were supervised by fitness professionals who classified their performance into one of five different categories:  exactly according to the specification provided (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). In the meantime the participants had accelerometers attached to their belt, forearm, arm, and the dumbbell that measured their movements and calculated various aggregates. The data can be derived from this [website](http://groupware.les.inf.puc-rio.br/har) where you can also find more information on the numerous variable aggregates. 
+These data were used to train an algorithm that should reliably predict the class of performance quality. The goal was to detect an algorithm that is as least as good in terms of accuracy as the one that was used in the original paper by [Velloso and colleagues](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) (98,2 % on average across all five exercise classes).  
+Reducing the 160 variables available to 46 and choosing a random forest approach with 5-fold cross validation on centered and scaled data,  I finally ended up with a model that achieved 99.6 percent accuracy in predicting the exercise class.
+
+
+## 2. Preparing the session
+To reproduce all tasks that were performed on the data, the R packages 'caret', 'ggplot2', 'pROC', and 'psych', need to be available, so please attach them:
+```{r, cache=TRUE}
+library(caret)
+library(ggplot2)
+library(Hmisc)
+library(pROC)
+```
+
+
+## 3. Reading in the datasets
+The training dataset can be accessed online. If you run the R code below, it is downloaded if it is not already present in the current working directory and stored into an object named 'train_all ' (taking care that headers and NAs are recognized):
+```{r, cache=TRUE}
+read_data_train <- function() {
+    file = "pml-training.csv"
+    url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+    if (!file.exists(file)) {
+        download.file(url, destfile = file)
+    }
+    data <- read.csv(file, header=T, na.strings=c('""', "NA", "#DIV/0!")) 
+}
+
+train_all <- read_data_train()
+```
+
+The same can be done with the test data (to be stored in an object called 'test_all'):
+```{r, cache=TRUE}
+read_data_test <- function() {
+    file = "pml-testing (1).csv"
+    url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+    if (!file.exists(file)) {
+        download.file(url, destfile = file)
+    }
+    data <- read.csv(file, header=T, na.strings=c('""', "NA", "#DIV/0!")) 
+}
+
+test_all <- read_data_test()
+```
+
+
+## 4. Inspecting data sets and selecting predictors
+First thing I did, was running  `which(names(train_all)!= names(test_all))` to see whether the training and the test data set have the same structure. If all variables were identical, it would return `NULL`. Instead, it returns `160`. `names(train_all[160])` and `names(test_all[160])` show us, that this is due to the fact that the outcome variable 'classe' is missing in the test dataset, instead it has a column indicating the test case ID. This is totally fine and nothing we have to worry about, so from now on, we can make our predictor selection solely based on the training dataset.
+Calling `str(train_all)` shows that such a selection might indeed be a good thing to do, since the dataset is huge, featuring 160 variables which are certainly not all necessary for a proper prediction - might even be a source of error because of overfitting.
+In contrast to Velloso  et al., who used the feature selection algorithm based on correlation proposed by Hall in order to automatically identify the most relevant features for the model, I decided to perform the selection manually.  
+Therefore, I first applied the describe() function from the 'Hmisc' package to the train data (`describe(train_all)`) to take a more detailed look at the variables one by one. (Unfortunately, I cannot provide the output here, because the latest version of knitR still refuses to render Hmisc tables.)
+
+Going through all variables, one can see that there are no columns with few missings -  it is either the vast majority or no NA at all which perfectly justifies to omit all columns containing any NAs at one: 
+
+```{r}
+drops <- names(which(apply(is.na(train_all), 2, any))) #assesses names of variables that contain missings
+train_sub <- train_all[,!(names(train_all) %in% drops)] #creates a subset of the data that only keeps variables that do not match the ones with missings
+```
+
+Second, we should omit variables that simply do not make sense from a logical standpoint: We should erase all columns that would make the algorithm inapplicable for a new sample of participants, namely the rownumbers (marked as variable 'X') and 'user_name'.  Additionally, I decided not to keep time related variables as timestamps and time windows. Since all these variables appear to stretch across the first seven columns of the dataset, we can create the new subset fairly easily:
+```{r}
+train_sub <- train_sub[, -c(1:7)]
+```
+
+As a next step, I tried to assess near zero variables:
+```{r}
+nsv <- nearZeroVar(train_sub,saveMetrics=TRUE)
+```
+Unfortunately, this was not very successful, because, as you will see, when you call `nsv`, no variable is found to have a variance near zero. So, I used `round(apply(train_sub ,2, var),1)` to calculate variances manually and found 'gyros_belt_x', 'gyros_belt_y', 'gyros_belt_z', 'gyros_arm_y', 'gyros_arm_z',  'gyros_dumbbell_y', and  'gyros_forearm_x' to have a variance below 1, so I omitted them. Finally, I created a subset of the test data, that should only contain variables that were also in the final training subset: 
+      
+```{r, warning=FALSE}
+train_sub <- train_sub[, -c(5:7, 19, 20,32, 44)]
+test_sub <- test_all[,names(test_all) %in% names(train_sub)]
+all(names(test_sub) == names(train_sub[,-46])) #makes sure that all variables are equal in both datasets except for the outcome  'class'  which shall be predicted and therefor is not present in the test set.
+```
+
+## 5. Training the model and evaluating algorithms
+There are a few different models that work for this type of problem (logistic regression, support vector machines, artificial neural networks, and random forests). Since random forests are (ideal for multi-class classification problems with large data sets, I chose to implement some of this models to train the remaining training subset. 
+My first exploratory test was a rf model on scaled and centered data that used 5-fold cross-validation (to keep the runtime short). In order to speed it up, I also decided to allow parallel processing. Moreover, I demanded the training log:
+```{r, cache=TRUE, eval=FALSE}
+set.seed(32343)
+modelFit <- train(classe ~.,data=train_sub, method="rf", preProcess = c("center", "scale"), trControl = trainControl(method = "cv", number = 5, allowParallel = TRUE, verboseIter = TRUE))
+```
+
+A call on `modelFit$finalModel` yields an **error rate of 0.44** for the chosen k sample (implementing  500 trees with 23 variables tried at each split) against the rest of the dataset. Though the true out of sample error mostly tends to be underestimated, I would predict it to be at about the same size, since the data set at hand is so large. Accordingly, for the chosen model the overall accuracy was 99.56 percent. 
+
+This performance can be visalized quite nicely plotting a heatmap of the confusionmatrix, as suggested in [this blog post](http://ragrawal.wordpress.com/2011/05/16/visualizing-confusion-matrix-in-r/):
+```{r}
+#compute frequency of actual categories
+actual = as.data.frame(table(train_all$classe))
+names(actual) = c("Actual","ActualFreq")
+ 
+#build confusion matrix
+confusion = as.data.frame(table(train_all$classe, modelFit$finalModel$predicted))
+names(confusion) = c("Actual","Predicted","Freq")
+ 
+#calculate percentage of test cases based on actual frequency
+confusion = merge(confusion, actual)
+confusion$Percent = confusion$Freq/confusion$ActualFreq*100
+ 
+#render plot
+# we use three different layers
+# first we draw tiles and fill color based on percentage of test cases
+tile <- ggplot() +
+geom_tile(aes(x=Actual, y=Predicted,fill=Percent),data=confusion, color="black",size=0.1) +
+labs(x="Actual",y="Predicted")
+tile = tile + 
+geom_text(aes(x=Actual,y=Predicted, label=sprintf("%.1f", Percent)),data=confusion, size=3, colour="black") +
+scale_fill_gradient(low="grey",high="green") + ggtitle("Confusion Matrix")
+ 
+# lastly we draw diagonal tiles. We use alpha = 0 so as not to hide previous layers but use size=0.3 to highlight border
+tile = tile + 
+geom_tile(aes(x=Actual,y=Predicted),data=subset(confusion, as.character(Actual)==as.character(Predicted)), color="black",size=0.3, fill="black", alpha=0) 
+tile
+```
+
+
+As we can see, the diagonal pops out really well, indicating that almost all predicted values were identical with the actual values.
+
+In the same sence, the algorithm R's train() function chose yields an almost perfect ROC curve with an 'Area Under The Curve' of nearly 1:
+```{r}
+out <- as.numeric(train_all$classe)
+pre <- as.numeric(modelFit$finalModel$predicted)
+roc <- roc(out, pre)
+plot(roc, main="ROC of predictions from the final model")
+legend(x= 0.4, y= 0.2, legend= paste ("AUC = ", round(roc$auc, 3)))
+```
+
+Applied to the test dataset (`predict(modelFit,newdata=test_sub)`), this algorithm predicts  'B A B A A E D B A A B C B A E E A B B B' as the sequence of classes.
+
+## 6. Alternatives
+I also tested this model against several others with different parameter settings.
+Changing preprocessing options to principal components analysis (`method = "pca"`) led to a little lower accuracy of 98.2 percent and interestingly to different predictions for the 20 test cases (category A instead of B for the third test case).  
+I also tried to change the method to 'gbm' for boosted trees which yielded lower accuracy (96 percent) which might probably be good to prevent overfitting. Nevertheless, the predicted sequence for the 20 test cases is the same. 
+Changing the number of folds for the cross validation only maximized the processing time but did not affect the accuracy, neither did it lead to different predictions for the test cases (I also tried the default 10 folds and an algorithm with 50 folds). So finally, I would suggest to keep the algorithm that I implemented first.
+      
+## References
+- Hall, M. A. Correlation-based Feature Subset Selection for Machine Learning. PhD thesis, Department of Computer Science, University of Waikato, Hamilton, New Zealand, Apr. 1999. 
+- Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013. 
